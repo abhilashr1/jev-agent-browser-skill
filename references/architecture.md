@@ -16,6 +16,14 @@ Each bounded decision iteration:
 
 Default Choice confidence is **0.55**; completion threshold is **0.82**; maximum decision iterations are **20** (configurable 1–100). Three equivalent semantic actions in the recent four records trigger a loop stop. Freshness compares full raw snapshots/refs and tab inventory, not only the truncated model context. Stale observations or explicit CLI error codes `stale_ref`, `invalid_ref`, `ref_not_found`, and `tab_gone` discard the decision and consume an iteration, with at most two recoveries per run. Other action failures stop because execution may already have occurred. No ref is repaired or action replayed deterministically.
 
+## Read contract
+
+Read mode is a separate deterministic pipeline and never calls TypeSafe. It opens the user-supplied URL or resumes a dedicated session, checks stable tab identity and an allowed HTTP(S) URL, obtains body text through `agent-browser get text body`, reads the title, and then rechecks the URL and complete tab inventory. Explicit stale observations are retried at most twice.
+
+The result contains bounded normalized text, title, original character count, truncation state, final origin, and an explicit untrusted-content marker. Control characters are stripped; refs, selectors, field values, URL paths, query strings and fragments are not returned. The default bound is 30,000 characters and the configurable maximum is 100,000. Empty text fails with `needs_guidance`.
+
+Read mode rejects supplied values, environment-backed secrets, effect authorization and image output. Its text is intended for extraction, comparison and summarization by the invoking LLM. It cannot grant authorization or select the next browser element. A mixed workflow alternates read phases with decide phases in one named session; each decide phase receives only the next semantic outcome.
+
 ## Tabs and lifecycle
 
 Tab identity prefers `targetId`, then `tabId`, then a validated string `id`; numeric indexes and ambiguous inventories fail closed. Exactly one tab must be active. Same-URL tabs remain separate options. Only permitted tabs are described to Jev. New tabs are discovered on the next iteration; switching remains a Jev decision, never a supervisor choice or an automatic guess.
@@ -26,12 +34,12 @@ Sessions have random names unless explicitly named. Startup probes a browser bef
 
 | Boundary | Deterministic enforcement / remaining trust |
 | --- | --- |
-| Model to executor | Choice lookup into current records; validated refs; no generated command or selector. |
-| Page to model | Untrusted-data instructions, bounded text, metadata-only secrets and known-string redaction; prompt injection remains possible. |
+| Model to executor | In decide mode, Choice lookup into current records; validated refs; no generated command or selector. Read mode has no model-selected execution. |
+| Page to model | Decide mode sends untrusted bounded text to Jev. Read mode returns bounded non-actionable text to the invoking LLM. Both retain untrusted-data instructions and known-string redaction; prompt injection remains possible. |
 | Page effects | All activations/fills require `--allow-risky` plus a semantic `--authorization`; this run-scoped grant cannot prove actual page behavior matches consent. |
 | Network | Exact host allowlist passed to every browser batch; active URLs and tab candidates are checked again locally. Agent-browser must enforce redirects/subresources and reject incompatible configurations. No unrestricted option. |
 | Credentials | Environment sources only, separately bound to an allowed HTTPS host, withheld from Jev, stripped from browser environment, transported in stdin. Destination pages and trusted local processes can still see them. |
-| Output | No raw subprocess/API errors, page labels/text, values, full URLs, or output paths in result logs. Only status, bounded decision metadata, session ID and optional final origin. |
+| Output | Decide mode emits no raw subprocess/API errors, page labels/text, values, full URLs, or output paths. Read mode deliberately emits bounded title/body text marked untrusted, while still omitting refs, selectors, field values and full URLs. |
 | Files | User-selected new PNG only; exclusive creation rejects existing files/symlinks. Screenshot goes to a private sibling staging directory, is size/header checked, copied through the reserved descriptor, and cleaned up. No original-image download. |
 
 URL query strings/fragments are omitted from model-facing URL fields; known secret echoes are also scrubbed throughout payloads. Unknown secrets, arbitrary encodings, URL paths containing private data, and rendered image pixels cannot be reliably redacted. Do not use confidential pages without consent to share their observed contents with TypeSafe. Host restrictions do not prevent same-host exfiltration or effects, constrain ports, distinguish tenant accounts, or reliably identify the origin of a referenced subframe. Do not route sensitive credentials into untrusted or multi-origin content.
@@ -39,6 +47,8 @@ URL query strings/fragments are omitted from model-facing URL fields; known secr
 Agent-browser and its installation/configuration are trusted dependencies. The controller does not load shell profiles, credential stores or `.env` files, and does not auto-install packages. Prerequisite diagnostics probe version and basic CLI capabilities but cannot certify browser semantics or network containment. No doctor command is invoked automatically because it can inspect and modify local daemon/configuration state. See the README for setup and residual platform checks.
 
 ## External contracts
+
+TypeSafe is used only by decide mode. Read mode neither requires an API key nor makes an API request.
 
 TypeSafe request:
 
@@ -49,7 +59,7 @@ Content-Type: application/json
 
 Authorization is supplied from `TYPESAFE_API_KEY` in memory. The model defaults to `jev-latest`; only `jev-*` names are accepted, including the response model. Requests reject redirects and have a 30-second timeout; only HTTP **429/529** retry, up to four attempts with exponential delay. Response reading is limited to 1 MiB. There is no endpoint override; tests inject an in-memory fetch implementation instead.
 
-The CLI adapter requires agent-browser **0.38.1+** and basic batch/domain capabilities. It expects a one-row JSON batch array with `success`, `result`, and optional `code`; confirmations remain binding even on a successful transport. CLI calls are shell-free, have a 45-second process timeout and an 8 MiB output limit. A native executable or Node launcher supports Windows without shell escaping. OS error details and batch `command` echoes never leave the adapter.
+The CLI adapter requires agent-browser **0.38.1+** and basic batch/domain capabilities. Decide mode uses compact accessibility snapshots; read mode uses `get text body` plus stable URL/tab checks. It expects a one-row JSON batch array with `success`, `result`, and optional `code`; confirmations remain binding even on a successful transport. CLI calls are shell-free, have a 45-second process timeout and an 8 MiB output limit. A native executable or Node launcher supports Windows without shell escaping. OS error details and batch `command` echoes never leave the adapter.
 
 Consult authoritative contracts before changing fields:
 

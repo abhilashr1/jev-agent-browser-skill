@@ -7,26 +7,29 @@ import { fileURLToPath } from "node:url";
 import {
   BrowserError, allowedUrl, askJev, buildActions, createBrowser, httpUrl,
   main, makePayload, makeRedactor, normalizeHost, normalizeTabs, observe,
-  parseArgs, prepareValues, prerequisiteReport, runController, saveImage,
+  parseArgs, prepareValues, prerequisiteReport, readPage, runController, runReadController, saveImage,
   validateDecision, validateImagePath,
 } from "../scripts/jev-browser.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ORIGIN = "https://example.com";
 const options = (...args) => ({ ...parseArgs(["--url", ORIGIN, "--goal", "Find the requested information", ...args]), session: "isolated", model: "jev-latest" });
+const readOptions = (...args) => ({ ...parseArgs(["--mode", "read", "--url", ORIGIN, ...args]), session: "isolated" });
 const authorized = (...args) => options("--allow-risky", "--authorization", "Perform only the requested effect", ...args);
 const decision = (choice = "finish", completion = 0.95, confidence = 0.95) => ({ model: "jev-latest", answers: { objective_complete: { type: "noul", noul: completion }, next_action: { type: "choice", choice, confidence } } });
 
 function world(overrides = {}) {
   const state = {
-    url: ORIGIN, snapshot: "- heading \"Requested information\"", refs: {},
+    url: ORIGIN, text: "Requested information", snapshot: "- heading \"Requested information\"", refs: {},
     tabs: [{ targetId: "target-a", active: true, url: ORIGIN, title: "Information" }], ...overrides,
   };
   const calls = [];
   const browser = command => {
     calls.push(command);
     if (command[0] === "tab" && command[1] === "list") return structuredClone({ tabs: state.tabs });
-    if (command[0] === "get") return { url: state.url };
+    if (command[0] === "get" && command[1] === "url") return { url: state.url };
+    if (command[0] === "get" && command[1] === "text") return { text: state.text };
+    if (command[0] === "get" && command[1] === "title") return { title: state.tabs.find(tab => tab.active)?.title ?? "" };
     if (command[0] === "snapshot") return { snapshot: state.snapshot, refs: structuredClone(state.refs) };
     if (command[0] === "tab") {
       for (const tab of state.tabs) tab.active = tab.targetId === command[1];
@@ -40,6 +43,10 @@ function world(overrides = {}) {
 
 async function control(opts = options(), w = world(), ask = async () => decision(), extra = {}) {
   return runController(opts, { browser: w.browser, ask, values: new Map(), specs: [], redact: value => value, ...extra });
+}
+
+async function readControl(opts, w = world(), extra = {}) {
+  return runReadController(opts, { browser: w.browser, redact: value => value, ...extra });
 }
 
 function mockSpawn(w = world(), hook) {
@@ -67,6 +74,19 @@ test("exact host policy is additive, case-normalized and never implicit for a re
   assert.equal(allowedUrl("https://example.com:8443/path", opts), true);
   assert.throws(() => parseArgs(["--session", "isolated", "--goal", "Read information"]), /allowlist/);
   assert.throws(() => options("--no-domain-restriction"), /Unknown/);
+});
+
+test("read mode is explicit, bounded and excludes Jev effects and values", () => {
+  const opts = readOptions("--read-limit", "1200");
+  assert.equal(opts.mode, "read");
+  assert.equal(opts.readLimit, 1200);
+  assert.equal(opts.goal, undefined);
+  assert.throws(() => readOptions("--goal", "Extract information"), /decide mode/);
+  assert.throws(() => readOptions("--value", "topic=text"), /Read mode/);
+  assert.throws(() => readOptions("--allow-risky", "--authorization", "Click links"), /Read mode/);
+  assert.throws(() => readOptions("--save-image", "image.png"), /Read mode/);
+  assert.throws(() => readOptions("--read-limit", "999"), /read-limit/);
+  assert.throws(() => parseArgs(["--mode", "other", "--url", ORIGIN]), /mode/);
 });
 
 test("reject malformed URLs, credentials in URLs and wildcard domains", () => {
@@ -151,6 +171,49 @@ test("malformed model responses cannot become executable or completion decisions
   assert.throws(() => validateDecision(decision("invented"), actions), /unknown/);
   assert.throws(() => validateDecision({ ...decision(), model: "other-planner" }, actions), /model/);
   assert.throws(() => validateDecision({ answers: {} }, actions));
+});
+
+test("read mode returns bounded untrusted text without refs or a TypeSafe decision", async () => {
+  const w = world({ text: `Headline one\n${"x".repeat(1400)}` });
+  const opts = readOptions("--read-limit", "1000");
+  const page = readPage(opts, w.browser);
+  assert.equal(page.text.length, 1000);
+  assert.equal(page.truncated, true);
+  const result = await readControl(opts, w);
+  assert.equal(result.status, "completed");
+  assert.equal(result.mode, "read");
+  assert.equal(result.content.untrusted, true);
+  assert.equal(result.content.truncated, true);
+  assert.match(result.content.text, /Headline one/);
+  assert.ok(!result.content.text.includes("@e"));
+  assert.ok(!w.calls.some(command => command[0] === "snapshot"));
+  assert.equal(w.calls.at(-1)[0], "close");
+});
+
+test("read mode reobserves races, redacts known secrets and supports mixed-session continuation", async () => {
+  const secret = randomUUID();
+  const w = world({ text: `Public result ${secret}` });
+  let changed = false;
+  const browser = command => {
+    const result = w.browser(command);
+    if (!changed && command[0] === "get" && command[1] === "text") {
+      changed = true;
+      w.state.tabs[0].title = "Updated information";
+    }
+    return result;
+  };
+  const opts = readOptions("--keep-open");
+  const result = await runReadController(opts, { browser, redact: makeRedactor([secret]) });
+  assert.equal(result.status, "completed");
+  assert.match(result.content.text, /\[REDACTED\]/);
+  assert.equal(w.calls.filter(command => command[0] === "get" && command[1] === "text").length, 2);
+  assert.ok(!w.calls.some(command => command[0] === "close"));
+});
+
+test("empty readable pages fail closed", async () => {
+  const result = await readControl(readOptions(), world({ text: "  \n" }));
+  assert.equal(result.status, "needs_guidance");
+  assert.match(result.reason, /no readable/);
 });
 
 test("completion requires stable permitted page and BOTH Choice and Noul gates", async () => {
@@ -347,7 +410,7 @@ test("subprocess error/confirmation handling never reflects raw command or outpu
   assert.throws(() => browser(["snapshot"]), error => !error.message.includes(secret));
 });
 
-test("prerequisite diagnostics report missing key and CLI with actionable setup only", () => {
+test("prerequisite diagnostics report only mode-relevant requirements", () => {
   const report = prerequisiteReport({}, { check() { throw new Error("private details"); } });
   assert.equal(report.ok, false);
   const text = JSON.stringify(report);
@@ -355,6 +418,9 @@ test("prerequisite diagnostics report missing key and CLI with actionable setup 
   assert.match(text, /TYPESAFE_API_KEY/);
   assert.match(text, /unverified/);
   assert.ok(!text.includes("private details"));
+  const readReport = prerequisiteReport({}, { check() { return "0.38.1"; } }, { requireApi: false });
+  assert.equal(readReport.ok, true);
+  assert.ok(!JSON.stringify(readReport).includes("TYPESAFE_API_KEY"));
 });
 
 test("--check is network-free, browser-free, sanitized and useful for missing prerequisites", async () => {
@@ -394,6 +460,20 @@ test("missing browser binary produces actionable startup error and cleanup witho
   assert.match(emitted[0].reason, /agent-browser install/);
   assert.ok(!mocked.calls.some(call => call.config.input && JSON.parse(call.config.input)[0][1] === ORIGIN));
   assert.equal(w.calls.at(-1)[0], "close");
+});
+
+test("mocked read-mode CLI run returns content without an API key or TypeSafe request", async () => {
+  const w = world({ text: "Five public headlines are visible" });
+  const mocked = mockSpawn(w);
+  const emitted = [];
+  const code = await main(["--mode", "read", "--url", ORIGIN], {
+    env: {}, spawn: mocked.spawn, emit: value => emitted.push(value),
+    fetchImpl: () => assert.fail("read mode must not call TypeSafe"),
+  });
+  assert.equal(code, 0);
+  assert.equal(emitted[0].status, "completed");
+  assert.equal(emitted[0].content.text, "Five public headlines are visible");
+  assert.ok(!mocked.calls.some(call => call.args.includes("snapshot")));
 });
 
 test("mocked end-to-end CLI run covers prerequisite probes, API, completion and cleanup", async () => {
